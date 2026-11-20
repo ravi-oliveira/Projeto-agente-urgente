@@ -1,0 +1,2 @@
+banco_rag_saude/*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+banco_rag_saude/**/*.bin filter=lfs diff=lfs merge=lfs -text
