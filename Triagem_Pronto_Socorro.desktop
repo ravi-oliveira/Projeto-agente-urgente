@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Triagem Pronto-Socorro IA
+Comment=Sistema de Acolhimento e Classificacao de Risco
+Exec=bash -c 'cd "$(dirname "%k")" && ./iniciar_linux.sh'
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Utility;MedicalSoftware;

@@ -1,15 +1,24 @@
 import ollama
+import chromadb
 import json
 import os
 import datetime
 import threading
 import customtkinter as ctk
 
-# --- CONFIGURAÇÕES DO SISTEMA ---
-MODELO_LLM = "qwen2.5:7b"
-ARQUIVO_BANCO = "fila_triagem.json"
+import sys
 
-# Tabela Oficial de Classificação de Risco (Protocolo de Manchester)
+BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+PASTA_BANCO_RAG = os.path.join(BASE_DIR, "banco_rag_saude")
+ARQUIVO_BANCO_FILA = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "fila_triagem.json")
+
+# --- CONFIGURAÇÕES DO SISTEMA ---
+MODELO_LLM = "qwen2.5:14b"
+MODELO_EMBED = "bge-m3"
+PASTA_BANCO_RAG = "banco_rag_saude"
+ARQUIVO_BANCO_FILA = "fila_triagem.json"
+
+# Tabela Oficial de Classificação de Risco (Protocolo de Manchester / UPA)
 PROTOCOLO_MANCHESTER = [
     {
         "nivel": 1,
@@ -17,21 +26,19 @@ PROTOCOLO_MANCHESTER = [
         "cor_nome": "Vermelho",
         "classificacao": "Emergência",
         "tempo": "Imediato (0 min)",
-        "exemplos": "Risco iminente de morte, parada cardiorrespiratória, falta de ar grave ou choque.",
+        "exemplos": "Risco iminente de morte, parada cardiorrespiratória, falta de ar grave, dor precordial ou choque.",
         "hex": "#DC2626",
-        "hex_suave": "#FEF2F2",
-        "texto_badge": "#FFFFFF"
+        "hex_suave": "#FEF2F2"
     },
     {
         "nivel": 2,
         "sigla": "LR",
         "cor_nome": "Laranja",
         "classificacao": "Muito urgente",
-        "tempo": "Até 10 minutos (varia até 15–20 min)",
-        "exemplos": "Risco grave, dor intensa, sangramento importante ou piora rápida de sinais vitais.",
+        "tempo": "Até 10 min (15–20 min)",
+        "exemplos": "Risco grave, dor intensa (8-10/10), sangramento importante, alteração de consciência ou sinais vitais.",
         "hex": "#EA580C",
-        "hex_suave": "#FFF7ED",
-        "texto_badge": "#FFFFFF"
+        "hex_suave": "#FFF7ED"
     },
     {
         "nivel": 3,
@@ -39,10 +46,9 @@ PROTOCOLO_MANCHESTER = [
         "cor_nome": "Amarelo",
         "classificacao": "Urgente",
         "tempo": "Até 60 minutos",
-        "exemplos": "Risco moderado, dor forte controlável, crise hipertensiva com sintomas ou suspeita de fratura.",
+        "exemplos": "Risco moderado, dor forte controlável (5-7/10), vômitos persistentes, febre alta ou suspeita de fratura.",
         "hex": "#CA8A04",
-        "hex_suave": "#FEFCE8",
-        "texto_badge": "#FFFFFF"
+        "hex_suave": "#FEFCE8"
     },
     {
         "nivel": 4,
@@ -50,27 +56,24 @@ PROTOCOLO_MANCHESTER = [
         "cor_nome": "Verde",
         "classificacao": "Pouco urgente",
         "tempo": "Até 120 minutos",
-        "exemplos": "Baixa gravidade, sintomas leves/estáveis, como dor de cabeça leve ou infecção sem sinais de alarme.",
+        "exemplos": "Baixa gravidade, sintomas leves/estáveis (dor 1-4/10), dor de cabeça leve ou infecção sem sinais de alarme.",
         "hex": "#16A34A",
-        "hex_suave": "#F0FDF4",
-        "texto_badge": "#FFFFFF"
+        "hex_suave": "#F0FDF4"
     },
     {
         "nivel": 5,
         "sigla": "AZ",
         "cor_nome": "Azul",
         "classificacao": "Não urgente",
-        "tempo": "Até 240 minutos (ou encaminhamento à UBS)",
+        "tempo": "Até 240 min (ou UBS)",
         "exemplos": "Quadros crônicos sem agudização, queixas antigas ou demandas eletivas, como troca de receitas.",
         "hex": "#2563EB",
-        "hex_suave": "#EFF6FF",
-        "texto_badge": "#FFFFFF"
+        "hex_suave": "#EFF6FF"
     }
 ]
 
 MAPA_CORES = {item["cor_nome"].upper(): item for item in PROTOCOLO_MANCHESTER}
 
-# Pesos de Prioridade Legal (Desempate dentro da mesma cor clínica)
 PESOS_PRIORIDADE = {
     "GESTANTE": (1, "G", "Gestante"),
     "IDOSO": (2, "I", "Idoso (60+)"),
@@ -80,10 +83,62 @@ PESOS_PRIORIDADE = {
 }
 
 
-# --- CAMADA DE DADOS E MOTOR DE ORDENAÇÃO DA FILA ---
+# --- MOTOR RAG CLÍNICO LOCAL (CHROMADB + BGE-M3) ---
+
+class MotorRAGClinico:
+    def __init__(self, caminho_banco=PASTA_BANCO_RAG):
+        self.ativo = False
+        self.colecao = None
+        if os.path.exists(caminho_banco):
+            try:
+                cliente = chromadb.PersistentClient(path=caminho_banco)
+                self.colecao = cliente.get_collection("protocolos_urgencia")
+                if self.colecao.count() > 0:
+                    self.ativo = True
+            except Exception:
+                self.ativo = False
+
+    def buscar_evidencias(self, relato_paciente):
+        """
+        Consulta os 3 documentos vetorizados separadamente para garantir que o LLM receba:
+        - Descritores de cor (Protocolo UPA)
+        - Sinais de alerta e vulnerabilidades (Caderno 28 MS)
+        - Código da queixa (CIAP-2 Brasil)
+        """
+        if not self.ativo or not self.colecao:
+            return ""
+
+        try:
+            resp = ollama.embed(model=MODELO_EMBED, input=[relato_paciente])
+            vetor_query = resp["embeddings"][0]
+
+            blocos = []
+            fontes_alvo = [
+                ("Protocolo_UPA", "PROTOCOLO UPA (DESCRITORES DE COR)", 2),
+                ("Caderno28_MS", "CADERNO 28 MS (SINAIS DE ALERTA)", 2),
+                ("CIAP2_Brasil", "CIAP-2 BRASIL (CÓDIGO DA QUEIXA)", 2)
+            ]
+
+            for chave_fonte, rotulo, k in fontes_alvo:
+                res = self.colecao.query(
+                    query_embeddings=[vetor_query],
+                    n_results=k,
+                    where={"fonte": chave_fonte}
+                )
+                docs = res.get("documents", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+                for d, m in zip(docs, metas):
+                    blocos.append(f"[{rotulo} | pág. {m.get('pagina', '?')}]: {d[:700]}")
+
+            return "\n\n".join(blocos)
+        except Exception:
+            return ""
+
+
+# --- CAMADA DE DADOS E ORDENAÇÃO DETERMINÍSTICA ---
 
 class GerenciadorFila:
-    def __init__(self, caminho_arquivo=ARQUIVO_BANCO):
+    def __init__(self, caminho_arquivo=ARQUIVO_BANCO_FILA):
         self.caminho = caminho_arquivo
         self.pacientes = self._carregar()
 
@@ -107,6 +162,19 @@ class GerenciadorFila:
         info_cor = MAPA_CORES[cor_key]
 
         prio_key = dados_triagem.get("prioridade_legal", "NORMAL").strip().upper()
+        # Trava determinística de Gênero e Idade
+        genero = dados_triagem.get("genero", "Não informado")
+        if prio_key == "GESTANTE":
+            genero = "Feminino"
+
+        idade_str = str(dados_triagem.get("idade", "Não informada"))
+        digitos_idade = "".join(c for c in idade_str if c.isdigit())
+        if digitos_idade and prio_key == "NORMAL":
+            idade_num = int(digitos_idade)
+            if idade_num >= 60:
+                prio_key = "IDOSO"
+            elif idade_num < 12:
+                prio_key = "CRIANCA"
         if prio_key not in PESOS_PRIORIDADE:
             prio_key = "NORMAL"
         peso_prio, letra_prio, rotulo_prio = PESOS_PRIORIDADE[prio_key]
@@ -127,6 +195,13 @@ class GerenciadorFila:
             "prioridade_legal": rotulo_prio,
             "peso_prioridade": peso_prio,
             "idade": dados_triagem.get("idade", "Não informada"),
+            "genero": genero,
+            "peso_kg": dados_triagem.get("peso_kg", "Não informado"),
+            "altura": dados_triagem.get("altura", "Não informada"),
+            "escala_dor_0_10": dados_triagem.get("escala_dor_0_10", "N/A"),
+            "sintomas_correlatos": dados_triagem.get("sintomas_correlatos", "Nenhum"),
+            "habitos_risco": dados_triagem.get("habitos_risco", "Não informado"),
+            "codigo_ciap2": dados_triagem.get("codigo_ciap2", "Não classificado"),
             "queixa_resumida": dados_triagem.get("queixa_resumida", ""),
             "justificativa_clinica": dados_triagem.get("justificativa_clinica", "")
         }
@@ -136,12 +211,6 @@ class GerenciadorFila:
         return registro
 
     def obter_fila_ordenada(self):
-        """
-        Ordenação determinística:
-        1º Gravidade Clínica (1=Vermelho ... 5=Azul)
-        2º Prioridade Legal (1=Gestante, 2=Idoso, 3=Criança, 4=PcD, 5=Normal)
-        3º Ordem cronológica de chegada (timestamp)
-        """
         return sorted(
             self.pacientes,
             key=lambda p: (p["nivel_clinico"], p["peso_prioridade"], p["timestamp"])
@@ -152,36 +221,60 @@ class GerenciadorFila:
         self._salvar()
 
 
-# --- MOTOR CONVERSACIONAL DE TRIAGEM (OLLAMA) ---
+# --- PROMPT CLÍNICO ORIENTADO POR RAG ---
 
 SYSTEM_PROMPT_TRIAGEM = """
-Você é um atendente virtual de acolhimento e triagem de um Pronto-Socorro.
-Seu papel é conversar de forma empática, clara, breve e objetiva com o paciente (ou acompanhante) para coletar informações suficientes e classificá-lo segundo o Protocolo de Manchester e prioridades legais.
+Você é um atendente de acolhimento humano, educado e objetivo de um Pronto-Socorro.
+Conduza a conversa de forma natural, fazendo no máximo 1 ou 2 perguntas curtas por vez.
 
-PROTOCOLO DE MANCHESTER (CORES):
-- VERMELHO (Emergência - 0 min): Risco iminente de morte, parada cardiorrespiratória, falta de ar grave, dor no peito intensa com suor frio/irradiação, inconsciência ou choque.
-- LARANJA (Muito urgente - até 10 min): Risco grave, dor intensa, sangramento importante, febre muito alta com prostração ou piora rápida de sinais vitais.
-- AMARELO (Urgente - até 60 min): Risco moderado, dor forte controlável, crise hipertensiva com sintomas, vômitos persistentes ou suspeita de fratura.
-- VERDE (Pouco urgente - até 120 min): Baixa gravidade, sintomas leves/estáveis, dor de cabeça leve, resfriado ou infecção sem sinais de alarme.
-- AZUL (Não urgente - até 240 min): Quadros crônicos sem agudização, queixas antigas ou demandas eletivas como troca de receitas e atestados.
+REGRAS CRÍTICAS DE COMPORTAMENTO:
+- NUNCA mencione termos técnicos ao paciente (NUNCA fale "CIAP-2", "Protocolo de Manchester", "prioridade legal" ou "codificar").
+- NUNCA pergunte se o paciente é criança ou idoso — você DEVE deduzir isso matematicamente pela idade informada (menor de 12 anos = CRIANCA; 60 anos ou mais = IDOSO).
+- NUNCA repita uma pergunta que o paciente já respondeu.
 
-PRIORIDADES LEGAIS:
-- GESTANTE, IDOSO (60 anos ou mais), CRIANCA (menor de 12 anos), PCD (Pessoa com Deficiência) ou NORMAL.
+FLUXO OBRIGATÓRIO DE PERGUNTAS (SIGA ESTA ORDEM, EXCETO SE FOR EMERGÊNCIA VERMELHO):
+1. IDENTIFICAÇÃO E CONDIÇÃO ESPECIAL: Antes de tudo, saiba para quem é o atendimento (para o próprio usuário ou acompanhante) e se o paciente é GESTANTE ou Pessoa com Deficiência (PcD).
+2. IDADE E GÊNERO:
+   - Pergunte a idade do paciente.
+   - Logo após saber a idade, pergunte o gênero do paciente.
+   - EXCEÇÃO OBRIGATÓRIA: Se o paciente informou que é GESTANTE, PULE a pergunta de gênero imediatamente e registre "genero": "Feminino".
+3. QUEIXA, ESCALA E SINTOMAS CORRELATOS:
+   - Entenda a queixa principal e há quanto tempo começou.
+   - Peça uma nota de 0 a 10 para a intensidade da dor ou sintoma.
+   - Pergunte se há sintomas correlatos (febre, náusea, tontura, visão turva, falta de ar, etc.).
+4. BIOMETRIA E HÁBITOS:
+   - Pergunte peso aproximado, altura aproximada e se há hábitos de risco (sedentarismo, tabagismo, álcool/substâncias) ou doenças crônicas.
+5. CONFIRMAÇÃO FINAL (OBRIGATÓRIA ANTES DE CONCLUIR):
+   - Quando tiver coletado todas as etapas acima, NÃO faça resumo técnico na conversa.
+   - Mantenha "status": "COLETANDO" e pergunte EXATAMENTE:
+     "Mais alguma informação relevante que deve ser informada? Se não, digite 'sim' para continuar."
+6. ENCERRAMENTO:
+   - Assim que o paciente responder à confirmação final (ex: "sim", "não", "só isso", "pode continuar"), mude "status" para "CONCLUIDO", preencha todos os campos de "dados_triagem" e envie apenas uma mensagem curta:
+     "Obrigado! Sua ficha de espera e classificação foram geradas abaixo."
 
-REGRAS DE CONDUÇÃO:
-1. Faça no máximo 1 ou 2 perguntas curtas por vez.
-2. Você precisa descobrir: (a) qual o sintoma principal, intensidade e há quanto tempo começou; (b) idade do paciente e se se enquadra em alguma prioridade legal (gestante, idoso, criança, PcD).
-3. REGRA DE EMERGÊNCIA IMEDIATA: Se o usuário relatar sinais claros de VERMELHO (ex: falta de ar grave, desmaio, dor forte no peito, hemorragia maciça), NÃO faça mais perguntas — conclua imediatamente a triagem como VERMELHO.
-4. Assim que tiver os sintomas e o perfil (ou em caso de emergência imediata), mude "status" para "CONCLUIDO" e preencha "dados_triagem". Enquanto ainda faltar informação, mantenha "status" como "COLETANDO".
+CLASSIFICAÇÃO DE RISCO (USO INTERNO PARA O JSON):
+- VERMELHO (0 min): Risco iminente de morte, falta de ar grave, dor no peito em aperto/irradiando, inconsciência, convulsão ativa, rigidez na nuca com febre ou "pior dor de cabeça da vida". (Em caso de VERMELHO, pule o restante do fluxo e conclua imediatamente).
+- LARANJA (10 min): Dor intensa (8 a 10/10), sangramento importante, febre > 40°C, trauma craniano recente.
+- AMARELO (60 min): Dor moderada (5 a 7/10), febre > 38,5°C, vômitos persistentes, crise hipertensiva com sintomas, suspeita de fratura.
+- VERDE (120 min): Dor leve (1 a 4/10), sintomas leves/estáveis sem sinais de alarme.
+- AZUL (240 min): Quadros crônicos estáveis, troca de receitas, atestados.
 
-RESPONDA SEMPRE E APENAS EM JSON VÁLIDO NO FORMATO EXATO ABAIXO:
+RESPONDA SEMPRE E APENAS EM JSON VÁLIDO NESTE FORMATO:
 {
+  "pensamento_interno": "Etapa atual do fluxo (1 a 6) | Dados já coletados | O que falta perguntar | Checagem: se gestante, pular gênero; se já tem idade, deduzir criança/idoso sem perguntar.",
   "status": "COLETANDO",
-  "mensagem_paciente": "Texto educado e direto para o paciente aqui.",
+  "mensagem_paciente": "Mensagem curta, humana e sem jargões técnicos.",
   "dados_triagem": {
     "cor": "VERDE",
     "prioridade_legal": "NORMAL",
     "idade": "Não informada",
+    "genero": "Não informado",
+    "peso_kg": "Não informado",
+    "altura": "Não informada",
+    "escala_dor_0_10": "Não aplicável",
+    "sintomas_correlatos": "Nenhum relatado",
+    "habitos_risco": "Não informado",
+    "codigo_ciap2": "Ex: N01 - Cefaleia",
     "queixa_resumida": "",
     "justificativa_clinica": ""
   }
@@ -189,7 +282,7 @@ RESPONDA SEMPRE E APENAS EM JSON VÁLIDO NO FORMATO EXATO ABAIXO:
 """
 
 
-# --- INTERFACE GRÁFICA CLÍNICA E LIMPA ---
+# --- INTERFACE GRÁFICA CLÍNICA LIMPA (5 CORES VISÍVEIS) ---
 
 class SistemaTriagemApp(ctk.CTk):
     def __init__(self):
@@ -197,17 +290,19 @@ class SistemaTriagemApp(ctk.CTk):
 
         ctk.set_appearance_mode("light")
         self.title("Acolhimento e Classificação de Risco — Pronto-Socorro")
-        self.geometry("1240x760")
-        self.minsize(1050, 650)
+        self.geometry("1260x780")
+        self.minsize(1060, 680)
         self.configure(fg_color="#F8FAFC")
 
         self.gerenciador = GerenciadorFila()
+        self.rag = MotorRAGClinico()
         self.historico_llm = []
+        self.relatos_paciente = []
         self.processando = False
         self.atendimento_concluido = False
 
-        self.grid_columnconfigure(0, weight=5)  # Painel Esquerdo: Tabela de Cores
-        self.grid_columnconfigure(1, weight=6)  # Painel Direito: Atendimento IA
+        self.grid_columnconfigure(0, weight=5)
+        self.grid_columnconfigure(1, weight=6)
         self.grid_rowconfigure(1, weight=1)
 
         self._construir_cabecalho()
@@ -216,7 +311,7 @@ class SistemaTriagemApp(ctk.CTk):
         self._iniciar_novo_atendimento()
 
     def _construir_cabecalho(self):
-        header = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=0, height=64, border_width=1, border_color="#E2E8F0")
+        header = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=0, height=62, border_width=1, border_color="#E2E8F0")
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
 
@@ -227,13 +322,13 @@ class SistemaTriagemApp(ctk.CTk):
             text_color="#0F172A",
             anchor="w"
         )
-        lbl_titulo.grid(row=0, column=0, padx=20, pady=16, sticky="w")
+        lbl_titulo.grid(row=0, column=0, padx=20, pady=15, sticky="w")
 
-        btn_fila = ctk.CTkButton(
+        ctk.CTkButton(
             header,
             text="Fila Ordenada (Pesquisa)",
-            width=185,
-            height=34,
+            width=180,
+            height=32,
             corner_radius=8,
             fg_color="#F1F5F9",
             hover_color="#E2E8F0",
@@ -242,102 +337,103 @@ class SistemaTriagemApp(ctk.CTk):
             border_color="#CBD5E1",
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._abrir_janela_fila
-        )
-        btn_fila.grid(row=0, column=1, padx=20, pady=14, sticky="e")
+        ).grid(row=0, column=1, padx=20, pady=12, sticky="e")
 
     def _construir_painel_tabela(self):
-        """Exibe apenas a tabela limpa de classificação de risco igual às unidades de saúde."""
+        """Usa grid com peso igual para garantir que TODAS as 5 cores caibam na tela."""
         container = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=14, border_width=1, border_color="#E2E8F0")
-        container.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        container.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=16)
         container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(2, weight=1)  # Faz a área das 5 cores ocupar todo o espaço livre
 
-        lbl_cab = ctk.CTkLabel(
+        ctk.CTkLabel(
             container,
             text="CLASSIFICAÇÃO DE RISCO (PROTOCOLO DE MANCHESTER)",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#0F172A",
             anchor="w"
-        )
-        lbl_cab.pack(fill="x", padx=20, pady=(18, 4))
+        ).grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 2))
 
-        lbl_sub = ctk.CTkLabel(
+        ctk.CTkLabel(
             container,
-            text="O atendimento é organizado pela gravidade clínica. Prioridades legais (gestantes, idosos, crianças e PcD) têm preferência dentro da mesma cor.",
+            text="Atendimento organizado por gravidade clínica. Prioridades legais têm preferência dentro da mesma cor.",
             font=ctk.CTkFont(size=11),
             text_color="#64748B",
-            wraplength=480,
+            wraplength=460,
             justify="left",
             anchor="w"
-        )
-        lbl_sub.pack(fill="x", padx=20, pady=(0, 14))
+        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
 
-        # Cards das 5 cores oficiais
-        for item in PROTOCOLO_MANCHESTER:
-            linha = ctk.CTkFrame(
-                container,
+        # Grade fixa de 5 linhas iguais (uma para cada cor)
+        grade_cores = ctk.CTkFrame(container, fg_color="transparent")
+        grade_cores.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 12))
+        grade_cores.grid_columnconfigure(0, weight=1)
+
+        for i, item in enumerate(PROTOCOLO_MANCHESTER):
+            # weight=1 em cada linha obriga o Python a dividir a altura em 5 partes iguais
+            grade_cores.grid_rowconfigure(i, weight=1)
+
+            card = ctk.CTkFrame(
+                grade_cores,
                 fg_color=item["hex_suave"],
                 corner_radius=10,
                 border_width=1,
                 border_color="#E2E8F0"
             )
-            linha.pack(fill="x", padx=18, pady=5)
+            card.grid(row=i, column=0, sticky="nsew", pady=4)
+            card.grid_columnconfigure(1, weight=1)
+            card.grid_rowconfigure(1, weight=1)
 
             # Faixa lateral colorida
-            faixa = ctk.CTkFrame(linha, fg_color=item["hex"], width=10, corner_radius=6)
-            faixa.pack(side="left", fill="y", padx=(6, 12), pady=6)
+            faixa = ctk.CTkFrame(card, fg_color=item["hex"], width=8, corner_radius=4)
+            faixa.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(6, 10), pady=6)
 
-            conteudo = ctk.CTkFrame(linha, fg_color="transparent")
-            conteudo.pack(side="left", fill="both", expand=True, pady=8, padx=(0, 12))
+            # Linha 1 do card: Cor + Tempo meta
+            topo = ctk.CTkFrame(card, fg_color="transparent")
+            topo.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(6, 0))
 
-            topo = ctk.CTkFrame(conteudo, fg_color="transparent")
-            topo.pack(fill="x")
-
-            lbl_cor = ctk.CTkLabel(
+            ctk.CTkLabel(
                 topo,
                 text=f"{item['cor_nome'].upper()} — {item['classificacao']}",
-                font=ctk.CTkFont(size=13, weight="bold"),
+                font=ctk.CTkFont(size=12, weight="bold"),
                 text_color=item["hex"]
-            )
-            lbl_cor.pack(side="left")
+            ).pack(side="left")
 
-            lbl_tempo = ctk.CTkLabel(
+            ctk.CTkLabel(
                 topo,
                 text=item["tempo"],
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color="#334155"
-            )
-            lbl_tempo.pack(side="right")
+            ).pack(side="right")
 
-            lbl_ex = ctk.CTkLabel(
-                conteudo,
+            # Linha 2 do card: Exemplos clínicos
+            ctk.CTkLabel(
+                card,
                 text=item["exemplos"],
-                font=ctk.CTkFont(size=12),
+                font=ctk.CTkFont(size=11),
                 text_color="#475569",
-                wraplength=440,
+                wraplength=430,
                 justify="left",
-                anchor="w"
-            )
-            lbl_ex.pack(fill="x", pady=(3, 0))
+                anchor="nw"
+            ).grid(row=1, column=1, sticky="nsew", padx=(0, 10), pady=(2, 6))
 
     def _construir_painel_atendimento(self):
         container = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=14, border_width=1, border_color="#E2E8F0")
-        container.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        container.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=18)
         container.grid_columnconfigure(0, weight=1)
         container.grid_rowconfigure(1, weight=1)
 
-        # Topo do chat
         topo_chat = ctk.CTkFrame(container, fg_color="transparent")
         topo_chat.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
 
-        lbl_atend = ctk.CTkLabel(
+        ctk.CTkLabel(
             topo_chat,
             text="ATENDIMENTO DE TRIAGEM",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#0F172A"
-        )
-        lbl_atend.pack(side="left")
+        ).pack(side="left")
 
-        self.btn_novo = ctk.CTkButton(
+        ctk.CTkButton(
             topo_chat,
             text="↻ Novo Paciente",
             width=125,
@@ -348,10 +444,8 @@ class SistemaTriagemApp(ctk.CTk):
             text_color="#0F172A",
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._iniciar_novo_atendimento
-        )
-        self.btn_novo.pack(side="right")
+        ).pack(side="right")
 
-        # Área de mensagens
         self.chat_scroll = ctk.CTkScrollableFrame(
             container,
             fg_color="#F8FAFC",
@@ -362,14 +456,13 @@ class SistemaTriagemApp(ctk.CTk):
         self.chat_scroll.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
 
-        # Barra de status + input
         rodape = ctk.CTkFrame(container, fg_color="transparent")
         rodape.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 16))
         rodape.grid_columnconfigure(0, weight=1)
 
         self.lbl_status = ctk.CTkLabel(
             rodape,
-            text="Aguardando resposta do paciente...",
+            text="Pronto para acolhimento.",
             font=ctk.CTkFont(size=11),
             text_color="#64748B",
             anchor="w"
@@ -403,7 +496,7 @@ class SistemaTriagemApp(ctk.CTk):
         )
         self.btn_enviar.grid(row=1, column=1)
 
-    # --- CONTROLE DE CONVERSA E INTERFACE ---
+    # --- FLUXO DE CONVERSA E TRIAGEM ---
 
     def _limpar_chat_ui(self):
         for widget in self.chat_scroll.winfo_children():
@@ -417,6 +510,7 @@ class SistemaTriagemApp(ctk.CTk):
             return
         self._limpar_chat_ui()
         self.atendimento_concluido = False
+        self.relatos_paciente = []
         self.entrada_msg.configure(state="normal")
         self.btn_enviar.configure(state="normal")
         self.lbl_status.configure(text="Pronto para acolhimento.")
@@ -424,8 +518,8 @@ class SistemaTriagemApp(ctk.CTk):
         self.historico_llm = [{"role": "system", "content": SYSTEM_PROMPT_TRIAGEM}]
         saudacao = (
             "Olá! Bem-vindo ao acolhimento do Pronto-Socorro.\n"
-            "Para agilizarmos sua senha de atendimento, por favor me informe: "
-            "o que você está sentindo hoje e qual a sua idade?"
+            "Antes de começarmos, o atendimento é para você ou para outra pessoa? "
+            "O paciente é gestante ou pessoa com deficiência (PcD)?"
         )
         self.historico_llm.append({
             "role": "assistant",
@@ -492,18 +586,21 @@ class SistemaTriagemApp(ctk.CTk):
         ).pack(pady=8)
 
         detalhes = (
-            f"Tempo Meta de Atendimento: {registro['tempo_meta']}\n"
-            f"Prioridade Legal: {registro['prioridade_legal']}  |  Idade: {registro['idade']}\n"
-            f"Resumo Clínico: {registro['queixa_resumida']}\n"
-            f"Critério da Triagem: {registro['justificativa_clinica']}\n"
-            f"Horário de Registro: {registro['hora_entrada']} ({registro['data']})"
+            f"Tempo Meta: {registro['tempo_meta']}  |  CIAP-2: {registro['codigo_ciap2']}\n"
+            f"Prioridade Legal: {registro['prioridade_legal']}  |  Idade: {registro['idade']}  |  Gênero: {registro.get('genero', 'Não informado')}\n"
+            f"Biometria: {registro['peso_kg']} / {registro['altura']}  |  Escala (0-10): {registro['escala_dor_0_10']}\n"
+            f"Queixa Principal: {registro['queixa_resumida']}\n"
+            f"Sintomas Correlatos: {registro['sintomas_correlatos']}\n"
+            f"Hábitos e Fatores de Risco: {registro['habitos_risco']}\n"
+            f"Critério Clínico: {registro['justificativa_clinica']}\n"
+            f"Registro: {registro['hora_entrada']} ({registro['data']})"
         )
         ctk.CTkLabel(
             card,
             text=detalhes,
             font=ctk.CTkFont(size=12),
             text_color="#1E293B",
-            wraplength=500,
+            wraplength=510,
             justify="left",
             anchor="w"
         ).pack(fill="x", padx=16, pady=(2, 14))
@@ -518,25 +615,49 @@ class SistemaTriagemApp(ctk.CTk):
 
         self.entrada_msg.delete(0, "end")
         self._adicionar_bolha("PACIENTE", texto, eh_usuario=True)
-        self.historico_llm.append({"role": "user", "content": texto})
+        self.relatos_paciente.append(texto)
 
         self.processando = True
         self.btn_enviar.configure(state="disabled")
-        self.lbl_status.configure(text="Analisando relato clínico com IA local...")
+        self.lbl_status.configure(text="Consultando protocolos clínicos (RAG) e avaliando risco...")
 
-        threading.Thread(target=self._processar_triagem_ia, daemon=True).start()
+        threading.Thread(target=self._processar_triagem_ia, args=(texto,), daemon=True).start()
 
-    def _processar_triagem_ia(self):
+    def _processar_triagem_ia(self, texto):
         try:
+            # 1. Adiciona a fala atual do paciente na memória da conversa
+            self.historico_llm.append({"role": "user", "content": texto})
+
+            # 2. Consulta os PDFs vetorizados usando o MotorRAGClinico da sua classe
+            relato_acumulado = " ".join(self.relatos_paciente)
+            contexto_rag = self.rag.buscar_evidencias(relato_acumulado)
+
+            mensagens_envio = list(self.historico_llm)
+            if contexto_rag:
+                mensagens_envio.insert(-1, {
+                    "role": "system",
+                    "content": (
+                        "BASE CLÍNICA DE REFERÊNCIA (Protocolo Maringá, Caderno 28 e CIAP-2) "
+                        "para apoiar sua decisão de risco e codificação CIAP-2:\n"
+                        f"{contexto_rag}"
+                    )
+                })
+
+            # 3. Envia para o Ollama
             resp = ollama.chat(
                 model=MODELO_LLM,
-                messages=self.historico_llm,
+                messages=mensagens_envio,
                 format="json"
             )
             conteudo_bruto = resp["message"]["content"]
             self.historico_llm.append({"role": "assistant", "content": conteudo_bruto})
 
+            # 4. Interpreta o JSON e exibe o Thinking no terminal
             dados = json.loads(conteudo_bruto)
+            pensamento = dados.get("pensamento_interno", "")
+            if pensamento:
+                print(f"\n[THINKING IA] -> {pensamento}")
+
             status = dados.get("status", "COLETANDO").upper()
             msg_paciente = dados.get("mensagem_paciente", "Poderia me dar mais detalhes sobre o que está sentindo?")
 
@@ -563,12 +684,12 @@ class SistemaTriagemApp(ctk.CTk):
             if not self.atendimento_concluido:
                 self.after(0, lambda: self.btn_enviar.configure(state="normal"))
 
-    # --- JANELA SECUNDÁRIA PARA PESQUISADORES (FILA ORDENADA) ---
+    # --- JANELA DE MONITORAMENTO PARA PESQUISADORES ---
 
     def _abrir_janela_fila(self):
         janela = ctk.CTkToplevel(self)
         janela.title("Monitor de Fila Prioritária — Visão para Pesquisadores")
-        janela.geometry("820x520")
+        janela.geometry("860x540")
         janela.configure(fg_color="#F8FAFC")
         janela.grab_set()
 
@@ -615,12 +736,16 @@ class SistemaTriagemApp(ctk.CTk):
             cor_hex = MAPA_CORES[p["cor"].upper()]["hex"]
             item_frame = ctk.CTkFrame(lista_scroll, fg_color="#FFFFFF", corner_radius=8, border_width=1, border_color="#E2E8F0")
             item_frame.pack(fill="x", pady=4)
+            item_frame.grid_columnconfigure(1, weight=1)
 
-            ctk.CTkFrame(item_frame, fg_color=cor_hex, width=8, corner_radius=4).pack(side="left", fill="y", padx=(6, 10), pady=6)
+            ctk.CTkFrame(item_frame, fg_color=cor_hex, width=8, height=10, corner_radius=4).grid(
+                row=0, column=0, sticky="ns", padx=(6, 10), pady=6
+            )
 
             texto_linha = (
                 f"{pos}º  |  Senha: {p['senha']}  |  {p['cor'].upper()} ({p['classificacao']})  |  "
                 f"{p['prioridade_legal']} (Idade: {p['idade']})  |  Entrada: {p['hora_entrada']}\n"
+                f"CIAP-2: {p.get('codigo_ciap2', '-')}  |  Descritor: {p.get('discriminador', '-')}\n"
                 f"Queixa: {p['queixa_resumida']}"
             )
             ctk.CTkLabel(
@@ -630,8 +755,8 @@ class SistemaTriagemApp(ctk.CTk):
                 text_color="#1E293B",
                 justify="left",
                 anchor="w",
-                wraplength=730
-            ).pack(side="left", fill="x", expand=True, pady=8, padx=(0, 10))
+                wraplength=760
+            ).grid(row=0, column=1, sticky="w", pady=8, padx=(0, 10))
 
 
 if __name__ == "__main__":

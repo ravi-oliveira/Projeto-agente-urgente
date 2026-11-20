@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 agent_ai.py
 fila_triagem.json
+documentos_medicos/
+dist/
+build/
+*.spec
